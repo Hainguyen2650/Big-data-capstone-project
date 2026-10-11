@@ -1,0 +1,8 @@
+airflow/.env
+data/
+data/airflow-logs/
+.tmp_ssc_probe/
+bctc/
+bctc bank/
+docs/
+airflow/.dockerignore
