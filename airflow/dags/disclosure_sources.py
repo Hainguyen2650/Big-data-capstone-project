@@ -1,16 +1,12 @@
-"""Lightweight HTML discovery for public HNX and SSC disclosure pages.
-
-This module intentionally stores discovery metadata only. Downloading source
-documents to MinIO is a separate pipeline step.
-"""
-
 from __future__ import annotations
 
 import hashlib
 import os
 import re
+import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Callable
 from typing import Any
 from urllib.parse import unquote, urljoin, urlparse, urlunparse
 
@@ -45,10 +41,8 @@ SOURCE_CONFIG = {
     },
 }
 
-
 class SourceLayoutError(RuntimeError):
-    """Raised when a source page cannot be parsed as a disclosure listing."""
-
+    ""
 
 def _allowed_url(url: str, source: str) -> bool:
     host = (urlparse(url).hostname or "").lower()
@@ -185,7 +179,7 @@ def _next_page(html: str, page_url: str, source: str) -> str | None:
 
 
 def _discover_detail_attachments(session: requests.Session, record: dict[str, Any], timeout: int) -> list[str]:
-    """Follow a notice page when attachment links are not present in its row."""
+
     if record["attachment_urls"]:
         return record["attachment_urls"]
     if not record["raw_metadata"].get("detail_link_found"):
@@ -249,7 +243,7 @@ def _download_attachment(
                 destination.write(chunk)
         if size == 0:
             raise ValueError("Downloaded attachment is empty")
-        # Content-addressed filename avoids overwriting a changed report.
+
         final_path = target_dir / f"{record['disclosure_id'][:12]}-{digest.hexdigest()[:12]}-{filename}"
         if final_path.exists():
             temp_path.unlink()
@@ -286,19 +280,18 @@ def _download_record_attachments(
 
 def _collect_ssc_with_browser(
     lookback_days: int, download_dir: str, max_downloads: int | None = None,
-) -> list[dict[str, Any]]:
-    """Read SSC's Oracle ADF table and click each row's PDF download action.
+    existing_files: dict[str, list[dict[str, Any]]] | None = None,
+    on_record: Callable[[dict[str, Any]], None] | None = None,
+):
 
-    SSC returns the document as a binary response to an ADF POST. There is no
-    stable per-file GET URL to extract from the listing HTML, so use a browser
-    session to preserve the server-side view state and download response.
-    """
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
     from playwright.sync_api import sync_playwright
 
     source_url = "https://congbothongtin.ssc.gov.vn/"
     timeout_ms = int(os.getenv("COLLECTOR_HTTP_TIMEOUT_SECONDS", "30")) * 1000
     output_dir = Path(download_dir).expanduser().resolve()
+    resume_dir = Path(os.getenv("COLLECTOR_RESUME_DIR", "")).expanduser() if os.getenv("COLLECTOR_RESUME_DIR") else None
+    existing_files = existing_files or {}
     cutoff = datetime.now() - timedelta(days=lookback_days)
     records_by_id: dict[str, dict[str, Any]] = {}
     attempted = 0
@@ -346,7 +339,10 @@ def _collect_ssc_with_browser(
                                         if REPORT_TYPE.search(title) else "Báo cáo tài chính"),
                         "published_at": published_at,
                         "attachment_urls": [],
-                        "local_files": [],
+                        "local_files": [
+                            dict(item) for item in existing_files.get(fingerprint, [])
+                            if item.get("object_uri")
+                        ],
                         "raw_metadata": {
                             "listing_page": source_url,
                             "listing_text": listing_text,
@@ -367,14 +363,27 @@ def _collect_ssc_with_browser(
                 for row_index, record in enumerate(page_records):
                     if record["published_at"] and record["published_at"] < cutoff:
                         continue
+                    if any(item.get("object_uri") for item in record["local_files"]):
+                        continue
                     if max_downloads is not None and attempted >= max_downloads:
                         break
                     attempted += 1
                     target_dir = output_dir / "ssc" / (record["ticker"] or "unknown")
                     target_dir.mkdir(parents=True, exist_ok=True)
                     existing = next(target_dir.glob(f"{record['disclosure_id'][:12]}-*"), None)
+                    if not existing and resume_dir:
+                        resume_matches = list((resume_dir / "ssc").glob(
+                            f"*/{record['disclosure_id'][:12]}-*"
+                        ))
+                        existing = next((item for item in resume_matches
+                                         if item.is_file() and item.suffix.lower() == ".pdf"), None)
                     if existing and existing.is_file():
                         digest = hashlib.sha256(existing.read_bytes()).hexdigest()
+                        if existing.parent != target_dir:
+                            restored_path = target_dir / existing.name
+                            if not restored_path.exists():
+                                shutil.copy2(existing, restored_path)
+                            existing = restored_path
                         record["local_files"].append({
                             "url": page.url, "path": str(existing), "filename": existing.name,
                             "sha256": digest, "size_bytes": existing.stat().st_size,
@@ -423,6 +432,10 @@ def _collect_ssc_with_browser(
                         record["local_files"].append({"url": page.url, "error": str(exc)[:1000]})
                     page.wait_for_timeout(500)
 
+                if on_record:
+                    for record in page_records:
+                        on_record(record)
+
                 if max_downloads is not None and attempted >= max_downloads:
                     break
 
@@ -463,13 +476,15 @@ def _safe_download_name(name: str) -> str:
 def collect_disclosures(
     source: str, lookback_days: int = 7, download_dir: str | None = None,
     max_downloads: int | None = None,
+    existing_files: dict[str, list[dict[str, Any]]] | None = None,
+    on_record: Callable[[dict[str, Any]], None] | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch listing pages and optionally download report attachments locally."""
     if source not in SOURCE_CONFIG:
         raise ValueError(f"Unsupported source: {source}")
 
     if source == "ssc" and download_dir:
-        return _collect_ssc_with_browser(lookback_days, download_dir, max_downloads)
+        return _collect_ssc_with_browser(lookback_days, download_dir, max_downloads, existing_files, on_record)
 
     import os
 

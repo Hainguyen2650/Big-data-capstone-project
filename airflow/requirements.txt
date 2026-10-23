@@ -1,5 +1,6 @@
 # Install these in the Airflow image used by this project.
-apache-airflow-providers-postgres>=7,<8
+apache-airflow-providers-postgres>=5.14,<7
 requests>=2.32,<3
 beautifulsoup4>=4.12,<5
 playwright==1.63.0
+boto3>=1.35,<2

@@ -10,6 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dags"))
 from disclosure_sources import collect_disclosures  # noqa: E402
+from minio_storage import upload_record_files  # noqa: E402
 
 
 def main() -> int:
@@ -27,10 +28,12 @@ def main() -> int:
     for source in sources:
         try:
             records = collect_disclosures(source, args.lookback_days, str(args.output_dir))
+            uploaded = upload_record_files(records)
             manifest["sources"][source] = records
             downloaded = sum(1 for row in records for item in row["local_files"] if item.get("path"))
             failed_downloads = sum(1 for row in records for item in row["local_files"] if item.get("error"))
-            print(f"{source}: {len(records)} announcements; {downloaded} files saved; {failed_downloads} download errors")
+            print(f"{source}: {len(records)} announcements; {downloaded} files saved; "
+                  f"{uploaded} files uploaded; {failed_downloads} download errors")
         except Exception as exc:
             failures.append((source, exc))
             manifest["sources"][source] = {"error": str(exc)}

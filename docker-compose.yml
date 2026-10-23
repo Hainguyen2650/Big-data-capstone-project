@@ -1,0 +1,23 @@
+name: financial-disclosures
+
+services:
+  airflow:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    image: financial-airflow:local
+    env_file:
+      - ./airflow/.env
+    environment:
+      COLLECTOR_RESUME_DIR: /opt/airflow/checkpoints/ssc-checkpoint
+    ports:
+      - "8081:8080"
+    volumes:
+      - airflow_logs:/opt/airflow/logs
+      - ./data/ssc-checkpoint:/opt/airflow/checkpoints/ssc-checkpoint
+    command: >-
+      bash -c "rm -f /opt/airflow/airflow-webserver.pid && exec airflow standalone"
+    restart: unless-stopped
+
+volumes:
+  airflow_logs:

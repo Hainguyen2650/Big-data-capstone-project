@@ -1,21 +1,23 @@
-"""Discover financial-report announcements from HNX and SSC into PostgreSQL."""
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
+import tempfile
 from datetime import timedelta
 
 import pendulum
-from airflow.sdk import dag, get_current_context, task
-from airflow.sdk.exceptions import AirflowSkipException
+from airflow.decorators import dag, task
+from airflow.exceptions import AirflowSkipException
 from airflow.providers.postgres.hooks.postgres import PostgresHook
+from airflow.operators.python import get_current_context
 
 from disclosure_sources import collect_disclosures
+from minio_storage import upload_record_files
 
 POSTGRES_CONN_ID = os.getenv("COLLECTOR_POSTGRES_CONN_ID", "financial_postgres")
 LOOKBACK_DAYS = int(os.getenv("COLLECTOR_LOOKBACK_DAYS", "7"))
-LOCAL_DATA_DIR = os.getenv("COLLECTOR_LOCAL_DATA_DIR", "/opt/airflow/data/landing")
 # HNX currently has no verified BCTC listing URL for this collector. Keep it out
 # of scheduled runs until a public report listing/endpoint has been identified.
 ENABLED_SOURCES = ("ssc",)
@@ -63,6 +65,7 @@ def collect_financial_disclosures():
 
         hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
         conn = hook.get_conn()
+        work_dir = tempfile.mkdtemp(prefix="financial-disclosures-")
         try:
             with conn.cursor() as cursor:
                 cursor.execute(
@@ -75,10 +78,33 @@ def collect_financial_disclosures():
                 )
             conn.commit()
 
+            if not os.getenv("MINIO_ENDPOINT", "").strip():
+                raise RuntimeError("MINIO_ENDPOINT is required; downloaded files are not stored locally")
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT disclosure_id, local_files FROM financial_disclosures WHERE source = %s",
+                    (source,),
+                )
+                existing_files = {
+                    disclosure_id: [item for item in (items or []) if item.get("object_uri")]
+                    for disclosure_id, items in cursor.fetchall()
+                }
+
+            checkpoint_uploads = [0]
             records = collect_disclosures(
-                source, lookback_days, LOCAL_DATA_DIR,
+                source, lookback_days, work_dir,
                 max_downloads=max_downloads if source == "ssc" else None,
+                existing_files=existing_files,
+                on_record=lambda record: checkpoint_uploads.__setitem__(
+                    0, checkpoint_uploads[0] + _checkpoint_record(
+                        conn, record, f"{run_id}:{source}", upload_record_files
+                    )
+                ) if source == "ssc" else None,
             )
+            uploaded_files = checkpoint_uploads[0] + upload_record_files(records)
+            for record in records:
+                for item in record.get("local_files", []):
+                    item.pop("path", None)
             with conn.cursor() as cursor:
                 for record in records:
                     cursor.execute(
@@ -112,7 +138,11 @@ def collect_financial_disclosures():
                     (len(records), len(records), f"{run_id}:{source}"),
                 )
             conn.commit()
-            return {"source": source, "records_seen": len(records), "records_upserted": len(records)}
+            resume_dir = os.getenv("COLLECTOR_RESUME_DIR", "").strip()
+            if resume_dir and os.path.isdir(resume_dir):
+                shutil.rmtree(resume_dir, ignore_errors=True)
+            return {"source": source, "records_seen": len(records), "records_upserted": len(records),
+                    "files_uploaded": uploaded_files}
         except Exception as exc:
             conn.rollback()
             with conn.cursor() as cursor:
@@ -126,6 +156,7 @@ def collect_financial_disclosures():
             conn.commit()
             raise
         finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
             conn.close()
 
     schema_ready = ensure_schema()
@@ -134,3 +165,37 @@ def collect_financial_disclosures():
 
 
 collect_financial_disclosures()
+
+
+def _checkpoint_record(conn, record, run_id, upload_files) -> int:
+    """Upload and commit each SSC record after its listing page is collected."""
+    uploaded = upload_files([record])
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """INSERT INTO financial_disclosures (
+                   disclosure_id, source, source_url, ticker, title, report_type,
+                   published_at, attachment_urls, local_files, raw_metadata, last_run_id,
+                   last_seen_at, updated_at
+               ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s, now(), now())
+               ON CONFLICT (disclosure_id) DO UPDATE SET
+                   ticker = COALESCE(EXCLUDED.ticker, financial_disclosures.ticker),
+                   title = EXCLUDED.title,
+                   report_type = COALESCE(EXCLUDED.report_type, financial_disclosures.report_type),
+                   published_at = COALESCE(EXCLUDED.published_at, financial_disclosures.published_at),
+                   attachment_urls = EXCLUDED.attachment_urls,
+                   local_files = EXCLUDED.local_files,
+                   raw_metadata = EXCLUDED.raw_metadata,
+                   last_run_id = EXCLUDED.last_run_id,
+                   last_seen_at = now(), updated_at = now()""",
+            (
+                record["disclosure_id"], record["source"], record["source_url"],
+                record["ticker"], record["title"], record["report_type"],
+                record["published_at"], json.dumps(record["attachment_urls"], ensure_ascii=False),
+                json.dumps(record["local_files"], ensure_ascii=False),
+                json.dumps(record["raw_metadata"], ensure_ascii=False), run_id,
+            ),
+        )
+    conn.commit()
+    for item in record.get("local_files", []):
+        item.pop("path", None)
+    return uploaded
